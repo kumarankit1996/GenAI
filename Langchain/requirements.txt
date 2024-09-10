@@ -1,5 +1,7 @@
-langchain-openai==0.1.21
+langchain-openai
 python-dotenv==1.0.1
-langchain==0.2.13
+langchain
 wikipedia==1.4.0
-tavily-python==0.3.9
+tavily-python
+sentence-transformers
+tqdm
