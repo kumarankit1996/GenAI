@@ -1,0 +1,23 @@
+# LangChain and Core Dependencies
+langchain>=0.1.0
+langchain-ollama>=0.1.0
+langchain-core>=0.1.0
+langchain-community>=0.1.0
+
+# Speech-to-Text (Faster Whisper is optimized for Apple Silicon)
+faster-whisper>=1.0.0
+
+# Audio Processing
+sounddevice>=0.4.6
+numpy>=1.24.0
+
+# Text-to-Speech (Optional - native macOS say command is used)
+pyttsx3>=2.90
+
+# Utilities
+python-dotenv>=1.0.0
+
+# Optional: For MacBook M4 optimization
+# ctranslate2 is included with faster-whisper
+# numpy-ml for local processing
+
