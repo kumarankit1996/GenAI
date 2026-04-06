@@ -3,15 +3,16 @@ LangChain Voice Agent Backend
 Provides streaming conversational AI with Databricks foundation models
 
 Best Practices Implemented:
-- ✅ LangChain streaming with proper generators
-- ✅ ChatMessageHistory for conversation management
-- ✅ Voice-optimized system prompts (concise, conversational)
-- ✅ MLflow tracing for observability
-- ✅ History truncation for latency optimization
-- ✅ Voice-specific metrics (first token latency, tokens/sec)
-- ✅ Comprehensive error handling
-- ✅ Session isolation and management
-- ✅ Latest databricks-langchain package
+- LangChain streaming with proper generators
+- ChatMessageHistory for conversation management
+- Voice-optimized system prompts (concise, conversational)
+- MLflow tracing for observability
+- History truncation for latency optimization
+- Voice-specific metrics (first token latency, tokens/sec)
+- Comprehensive error handling
+- Session isolation and management
+- Latest databricks-langchain package
+- Production-grade logging
 
 Reference: LangChain Voice Agent Best Practices
 """
@@ -19,8 +20,8 @@ Reference: LangChain Voice Agent Best Practices
 from typing import List, AsyncIterator, Optional, Dict, Any
 from databricks.sdk.core import Config
 import mlflow
-from mlflow.langchain import autolog
 import time
+import logging
 
 # Import ChatDatabricks from official databricks-langchain package
 from databricks_langchain import ChatDatabricks
@@ -31,18 +32,21 @@ from langchain_community.chat_message_histories import ChatMessageHistory
 from langchain_core.tracers import LangChainTracer
 import os
 
+# Configure logger
+logger = logging.getLogger(__name__)
+
 
 class VoiceAgent:
     """
     LangChain-based voice agent optimized for real-time interaction
     
     Features:
-    - ✅ Streaming responses for real-time feel
-    - ✅ Session-based conversation history with truncation
-    - ✅ MLflow tracing with voice-specific metrics
-    - ✅ Optimized for voice (concise, conversational responses)
-    - ✅ Latency-optimized (history truncation, efficient streaming)
-    - ✅ Databricks foundation model integration
+    - Streaming responses for real-time feel
+    - Session-based conversation history with truncation
+    - MLflow tracing with voice-specific metrics
+    - Optimized for voice (concise, conversational responses)
+    - Latency-optimized (history truncation, efficient streaming)
+    - Databricks foundation model integration
     
     Voice-Specific Optimizations:
     - First token latency < 500ms target
@@ -72,49 +76,45 @@ class VoiceAgent:
             max_history_turns: Maximum conversation turns to keep (1 turn = user + assistant)
                              Reduces latency by limiting context window. Default: 10 turns = 20 messages
         """
+        logger.info(f"Initializing VoiceAgent with model={model_endpoint}, temperature={temperature}, max_tokens={max_tokens}")
+        
         # Initialize Databricks config for authentication
         self.cfg = Config()
         
         # Voice optimization settings
         self.max_history_turns = max_history_turns
+        self.enable_tracing = enable_tracing
         
-        # Enable MLflow autologging for LangChain
-        if enable_tracing:
-            try:
-                autolog()
-            except Exception as e:
-                print(f"⚠️  MLflow autologging disabled: {e}")
-        
-        # Initialize LLM with streaming (using latest API)
+        # Initialize LLM with streaming
         try:
             self.llm = ChatDatabricks(
-                model=model_endpoint,  # ✅ FIXED: Use 'model=' instead of 'endpoint='
+                model=model_endpoint,
                 temperature=temperature,
                 max_tokens=max_tokens,
             )
-            print(f"✅ Initialized ChatDatabricks with model: {model_endpoint}")
-            print(f"📊 Voice optimization: max_history_turns={max_history_turns}")
+            logger.info(f"ChatDatabricks initialized successfully with model: {model_endpoint}")
+            logger.debug(f"Voice optimization settings: max_history_turns={max_history_turns}")
         except Exception as e:
-            print(f"❌ Failed to initialize ChatDatabricks: {e}")
+            logger.error(f"Failed to initialize ChatDatabricks: {e}", exc_info=True)
             raise
         
         # Default system prompt optimized for voice interactions
         # Based on LangChain voice agent best practices
-        self.system_prompt = system_prompt or """You are a helpful voice assistant powered by Databricks. 
+        self.system_prompt = system_prompt or """You are a professional voice assistant powered by Databricks.
 
 Keep your responses:
 - **Concise** (2-4 sentences maximum)
-- **Natural and conversational** (as if speaking to a friend)
+- **Professional and clear** (no emojis, no exclamation marks, no casual slang)
+- **Natural and conversational** (as if speaking in a business setting)
 - **Easy to understand when spoken aloud** (avoid jargon, use simple words)
 - **Avoid long lists** (use at most 3 items)
 - **No complex formatting** (no tables, code blocks, or markdown)
-- **Clear and direct** (get to the point quickly)
+- **Direct and informative** (get to the point quickly)
 
 When appropriate:
-- Ask clarifying questions (keep them short)
+- Ask clarifying questions (keep them brief)
 - Provide concrete examples
-- Be friendly and engaging
-- Use occasional confirmations ("Got it!", "Sure thing!")
+- Maintain a helpful, professional tone
 
 You have access to Databricks' powerful AI models for analysis and problem-solving."""
         
@@ -130,6 +130,8 @@ You have access to Databricks' powerful AI models for analysis and problem-solvi
         
         # In-memory conversation store (keyed by session_id)
         self.store: Dict[str, ChatMessageHistory] = {}
+        
+        logger.info("VoiceAgent initialization complete")
     
     def get_session_history(self, session_id: str) -> ChatMessageHistory:
         """
@@ -143,6 +145,7 @@ You have access to Databricks' powerful AI models for analysis and problem-solvi
         """
         if session_id not in self.store:
             self.store[session_id] = ChatMessageHistory()
+            logger.debug(f"Created new session history for session_id={session_id}")
         return self.store[session_id]
     
     def _truncate_history(
@@ -177,6 +180,7 @@ You have access to Databricks' powerful AI models for analysis and problem-solvi
             content=f"[Previous conversation context: {num_truncated} earlier messages not shown to reduce latency]"
         )
         
+        logger.debug(f"Truncated history: removed {num_truncated} messages, keeping {len(truncated)} recent messages")
         return [summary] + truncated
     
     @mlflow.trace(name="stream_response", span_type="CHAIN")
@@ -203,6 +207,8 @@ You have access to Databricks' powerful AI models for analysis and problem-solvi
         Yields:
             Response chunks as strings
         """
+        logger.info(f"Processing request for session_id={session_id}, input_length={len(user_input)}")
+        
         # Track timing for voice metrics
         start_time = time.time()
         first_token_time = None
@@ -216,6 +222,7 @@ You have access to Databricks' powerful AI models for analysis and problem-solvi
             session_history.clear()
             for msg in history:
                 session_history.add_message(msg)
+            logger.debug(f"Session history populated with {len(history)} messages")
         
         # Add user message
         session_history.add_message(HumanMessage(content=user_input))
@@ -256,7 +263,7 @@ You have access to Databricks' powerful AI models for analysis and problem-solvi
                             
                             # Flag if latency is too high for voice
                             if first_token_time > 0.5:  # 500ms threshold
-                                print(f"⚠️  High first token latency: {first_token_time:.2f}s")
+                                logger.warning(f"High first token latency: {first_token_time:.3f}s (target: <0.5s)")
                         
                         yield content
                 
@@ -281,6 +288,13 @@ You have access to Databricks' powerful AI models for analysis and problem-solvi
                 if total_time > 0:
                     tokens_per_second = token_count / total_time
                     mlflow.log_metric("tokens_per_second", tokens_per_second)
+                
+                logger.info(
+                    f"Response complete: session_id={session_id}, "
+                    f"total_time={total_time:.3f}s, tokens={token_count}, "
+                    f"first_token_latency={first_token_time:.3f}s if first_token_time else 'N/A', "
+                    f"tokens_per_sec={tokens_per_second:.2f} if total_time > 0 else 'N/A'"
+                )
             
             # Add assistant response to history
             if full_response:
@@ -289,13 +303,18 @@ You have access to Databricks' powerful AI models for analysis and problem-solvi
                 # Handle empty response
                 error_msg = "I apologize, but I couldn't generate a response. Please try again."
                 session_history.add_message(AIMessage(content=error_msg))
+                logger.warning(f"Empty response generated for session_id={session_id}")
                 yield error_msg
                 
         except Exception as e:
             error_msg = f"I encountered an error: {str(e)}. Please try again."
             session_history.add_message(AIMessage(content=error_msg))
-            mlflow.log_param("error", str(e))
-            mlflow.log_param("error_type", type(e).__name__)
+            logger.error(f"Error during stream_response: session_id={session_id}, error={str(e)}", exc_info=True)
+            
+            if self.enable_tracing:
+                mlflow.log_param("error", str(e))
+                mlflow.log_param("error_type", type(e).__name__)
+            
             yield error_msg
     
     async def get_response(
@@ -317,6 +336,7 @@ You have access to Databricks' powerful AI models for analysis and problem-solvi
         Returns:
             Complete response string
         """
+        logger.debug(f"get_response called for session_id={session_id}")
         response = ""
         async for chunk in self.stream_response(user_input, session_id, history):
             response += chunk
@@ -331,6 +351,9 @@ You have access to Databricks' powerful AI models for analysis and problem-solvi
         """
         if session_id in self.store:
             self.store[session_id].clear()
+            logger.info(f"Cleared history for session_id={session_id}")
+        else:
+            logger.debug(f"No history to clear for session_id={session_id}")
     
     def get_history(self, session_id: str = "default") -> List[BaseMessage]:
         """
@@ -360,7 +383,7 @@ You have access to Databricks' powerful AI models for analysis and problem-solvi
         user_messages = [msg for msg in history if msg.type == "human"]
         ai_messages = [msg for msg in history if msg.type == "ai"]
         
-        return {
+        stats = {
             "session_id": session_id,
             "total_messages": len(history),
             "user_messages": len(user_messages),
@@ -368,11 +391,21 @@ You have access to Databricks' powerful AI models for analysis and problem-solvi
             "max_history_turns": self.max_history_turns,
             "history_will_truncate": len(history) > self.max_history_turns * 2
         }
+        
+        logger.debug(f"Stats for session_id={session_id}: {stats}")
+        return stats
 
 
 # Example usage and testing
 if __name__ == "__main__":
     import asyncio
+    
+    # Configure logging for testing
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
     
     async def test_agent():
         print("=" * 60)
@@ -384,10 +417,10 @@ if __name__ == "__main__":
             agent = VoiceAgent(
                 max_history_turns=5  # Test with shorter history
             )
-            print("\n✅ Agent initialized successfully")
+            print("\nAgent initialized successfully")
             print(f"   History truncation: {agent.max_history_turns} turns\n")
         except Exception as e:
-            print(f"\n❌ Failed to initialize agent: {e}\n")
+            print(f"\nFailed to initialize agent: {e}\n")
             return
         
         # Test streaming response with metrics
@@ -398,7 +431,7 @@ if __name__ == "__main__":
         async for chunk in agent.stream_response("Hello! What can you help me with?"):
             print(chunk, end="", flush=True)
         elapsed = time.time() - start
-        print(f"\n⏱️  Response time: {elapsed:.2f}s\n")
+        print(f"\nResponse time: {elapsed:.2f}s\n")
         
         # Follow-up with history
         print("User: What did I just say?")
@@ -408,7 +441,7 @@ if __name__ == "__main__":
         async for chunk in agent.stream_response("What did I just say?"):
             print(chunk, end="", flush=True)
         elapsed = time.time() - start
-        print(f"\n⏱️  Response time: {elapsed:.2f}s\n")
+        print(f"\nResponse time: {elapsed:.2f}s\n")
         
         # Show stats
         stats = agent.get_stats()
@@ -417,7 +450,7 @@ if __name__ == "__main__":
             print(f"  {key}: {value}")
         
         print("\n" + "=" * 60)
-        print("✅ All tests passed - Voice agent ready for production")
+        print("All tests passed - Voice agent ready for production")
         print("=" * 60)
     
     # Run async test

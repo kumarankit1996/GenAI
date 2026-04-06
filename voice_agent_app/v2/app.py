@@ -12,19 +12,68 @@ from typing import AsyncIterator
 from agent import VoiceAgent
 import mlflow
 from uuid import uuid4
+import logging
+import sys
+import os
+
+# Configure production-grade logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - [%(filename)s:%(lineno)d] - %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S',
+    handlers=[
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+
+# Get logger for this module
+logger = logging.getLogger(__name__)
+
+# Configure MLflow to use Unity Catalog
+try:
+    # Set registry URI to use Unity Catalog
+    mlflow.set_registry_uri("databricks-uc")
+    
+    # Set experiment in Unity Catalog (or workspace location)
+    # For UC: use format "/<workspace_id>/<experiment_name>"
+    # For workspace: use format "/Users/<username>/<experiment_name>"
+    experiment_name = "/Users/kumarankit1996@gmail.com/voice_agent_experiments"
+    mlflow.set_experiment(experiment_name)
+    
+    logger.info(f"MLflow experiment set to: {experiment_name}")
+    logger.info(f"MLflow registry URI: databricks-uc")
+    
+    # Enable MLflow autologging for LangChain (with silent=True to suppress warnings)
+    # For inference/serving: only log traces, not models (model doesn't change at runtime)
+    mlflow.langchain.autolog(
+        log_input_examples=True,
+        log_model_signatures=True,
+        log_models=False,  # Don't log model on every request - only needed once for registration
+        log_traces=True,   # Track all requests/responses for observability
+        disable=False,
+        silent=True
+    )
+    logger.info("MLflow autologging enabled successfully (traces only, no model logging)")
+    
+except Exception as e:
+    logger.warning(f"Failed to configure MLflow: {e}")
 
 # Initialize FastAPI app
 app = FastAPI(title="Voice Assistant")
+logger.info("FastAPI application initialized")
 
 # Initialize agent
-agent = VoiceAgent(
-    model_endpoint="databricks-qwen3-next-80b-a3b-instruct",
-    temperature=0.7,
-    max_tokens=1000
-)
-
-# Enable MLflow tracing
-mlflow.langchain.autolog()
+try:
+    agent = VoiceAgent(
+        model_endpoint="databricks-qwen3-next-80b-a3b-instruct",
+        temperature=0.7,
+        max_tokens=1000,
+        enable_tracing=False  # Tracing already enabled globally above
+    )
+    logger.info("VoiceAgent initialized successfully")
+except Exception as e:
+    logger.error(f"Failed to initialize VoiceAgent: {e}", exc_info=True)
+    raise
 
 # HTML Frontend with voice interruption
 HTML_CONTENT = """
@@ -292,15 +341,15 @@ HTML_CONTENT = """
             <strong>⚙️ Voice Interruption Sensitivity</strong>
             <div class="setting-item">
                 <label>Min Words to Interrupt:</label>
-                <input type="range" id="minWordsSlider" class="slider" min="1" max="10" value="3" 
+                <input type="range" id="minWordsSlider" class="slider" min="2" max="10" value="3" 
                        oninput="updateMinWords(this.value)">
                 <span id="minWordsValue">3 words</span>
             </div>
             <div class="setting-item">
-                <label>Detection Delay:</label>
-                <input type="range" id="delaySlider" class="slider" min="300" max="2000" step="100" value="700" 
+                <label>Detection Delay (avoid echo):</label>
+                <input type="range" id="delaySlider" class="slider" min="800" max="2000" step="100" value="1200" 
                        oninput="updateDelay(this.value)">
-                <span id="delayValue">700ms</span>
+                <span id="delayValue">1200ms</span>
             </div>
             <div class="setting-item">
                 <label>
@@ -315,7 +364,7 @@ HTML_CONTENT = """
         </div>
         
         <div id="hint" class="hint">
-            💡 <strong>Voice Interrupt Enabled:</strong> Just start speaking while the assistant talks to interrupt! Use headphones for best results. Adjust sensitivity above if too sensitive/not responsive.
+            💡 <strong>Voice Interrupt:</strong> Start speaking to interrupt. <strong>Use headphones</strong> to prevent echo. The system captures your full phrase after interruption. Increase delay if you hear false triggers.
         </div>
         
         <div id="conversation" class="conversation"></div>
@@ -325,7 +374,7 @@ HTML_CONTENT = """
             • <strong>Voice Interruption:</strong> Speak anytime to interrupt (enabled by default)<br>
             • <strong>Continuous Mode:</strong> Automatic back-and-forth conversation<br>
             • <strong>Stop Words:</strong> Say "stop", "exit", or "quit" to end<br>
-            • <strong>Adjustable:</strong> Tune sensitivity if needed
+            • <strong>Best with headphones:</strong> Prevents assistant voice from triggering false interruptions
         </div>
         
         <div id="errorBox" class="error-box" style="display: none;"></div>
@@ -337,23 +386,29 @@ HTML_CONTENT = """
         let backgroundRecognition = null;
         let isListening = false;
         let isSpeaking = false;
-        let autoSpeak = true;
-        let voiceInterrupt = true;  // ON by default
-        let continuousMode = false;
+        let isProcessing = false;
         let currentTranscript = '';
         let interruptionTranscript = '';
-        let speechSynthesis = window.speechSynthesis;
-        let currentUtterance = null;
         let responseBuffer = '';
-        let isProcessing = false;
+        let currentAssistantMessage = null;
+        let continuousMode = false;
+        let voiceInterrupt = true;
+        let autoSpeak = true;
+        let lastTTSText = '';
         let showDebug = false;
         
-        // More lenient interruption settings
-        let minWordsToInterrupt = 3;  // Lower threshold
-        let interruptionDelay = 700;  // Shorter delay
+        // Interruption settings - IMPROVED DEFAULTS
+        let minWordsToInterrupt = 3;
+        let interruptionDelay = 1200;  // Increased from 700ms to 1200ms to avoid TTS echo
         let speakingStartTime = null;
         let lastInterruptionTime = 0;
         let interruptionCooldown = 2000;
+        let waitingForMoreSpeech = false;
+        let speechContinuationTimer = null;
+        let backgroundAccumulatedText = '';  // Accumulate ALL detected text
+        let backgroundFinalTranscript = '';  // Track final transcripts separately
+        let interruptionTriggerTimer = null;
+        let interruptionAutoSubmitTimer = null;  // NEW: Auto-submit timer
 
         const STOP_WORDS = ['stop', 'exit', 'quit', 'goodbye', 'bye bye', 'end conversation'];
 
@@ -450,9 +505,9 @@ HTML_CONTENT = """
             
             const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
             
-            // Main recognition
+            // Main recognition - continuous mode to capture full phrases
             recognition = new SpeechRecognition();
-            recognition.continuous = false;
+            recognition.continuous = true;
             recognition.interimResults = true;
             recognition.lang = 'en-US';
             
@@ -463,6 +518,13 @@ HTML_CONTENT = """
             };
             
             recognition.onresult = (event) => {
+                // Clear auto-submit timer when new speech is detected
+                if (interruptionAutoSubmitTimer) {
+                    clearTimeout(interruptionAutoSubmitTimer);
+                    interruptionAutoSubmitTimer = null;
+                    logDebug('Auto-submit cancelled - new speech detected');
+                }
+                
                 let interimTranscript = '';
                 let finalTranscript = '';
                 
@@ -475,16 +537,16 @@ HTML_CONTENT = """
                     }
                 }
                 
-                if (interruptionTranscript) {
-                    currentTranscript = interruptionTranscript + ' ' + (finalTranscript || interimTranscript);
-                } else {
-                    currentTranscript = finalTranscript || interimTranscript;
-                }
+                // Store ONLY new speech in currentTranscript (combination happens once in onend)
+                currentTranscript = finalTranscript || interimTranscript;
                 
+                
+                // Update display
                 document.getElementById('transcript').innerHTML = 
-                    (interruptionTranscript ? '<strong style="color: #ff5722;">' + interruptionTranscript + ' </strong>' : '') +
+                    (interruptionTranscript ? '<strong style="color: #ff5722;">[Interrupted] </strong>' : '') +
                     finalTranscript + '<i style="color: #999;">' + interimTranscript + '</i>';
                 
+                // Check for stop words
                 if (continuousMode && checkStopWords(currentTranscript)) {
                     recognition.stop();
                     continuousMode = false;
@@ -493,18 +555,46 @@ HTML_CONTENT = """
                         '<strong style="color: #f44336;">Conversation ended: Stop word detected</strong>';
                     return;
                 }
+                
+                // Reset speech continuation timer on new speech
+                if (speechContinuationTimer) {
+                    clearTimeout(speechContinuationTimer);
+                }
+                
+                // Wait for 1.5 seconds of silence before submitting
+                if (currentTranscript.trim()) {
+                    speechContinuationTimer = setTimeout(() => {
+                        if (isListening && currentTranscript.trim()) {
+                            recognition.stop();
+                        }
+                    }, 1500);
+                }
             };
             
             recognition.onend = () => {
                 isListening = false;
                 logDebug('Main recognition ended');
                 
-                if (currentTranscript.trim()) {
-                    const text = currentTranscript.trim();
-                    currentTranscript = '';
-                    interruptionTranscript = '';
+                if (speechContinuationTimer) {
+                    clearTimeout(speechContinuationTimer);
+                    speechContinuationTimer = null;
+                }
+                
+                // Clear auto-submit timer since recognition ended
+                if (interruptionAutoSubmitTimer) {
+                    clearTimeout(interruptionAutoSubmitTimer);
+                    interruptionAutoSubmitTimer = null;
+                }
+                
+                // ALWAYS combine interruption and current transcript
+                const combinedText = (interruptionTranscript + ' ' + currentTranscript).trim();
+                currentTranscript = '';
+                interruptionTranscript = '';
+                
+                if (combinedText) {
+                    logDebug(`Submitting combined text: "${combinedText}"`);
                     
-                    if (continuousMode && checkStopWords(text)) {
+                    if (continuousMode && checkStopWords(combinedText)) {
                         continuousMode = false;
                         updateUI();
                         document.getElementById('transcript').innerHTML = 
@@ -512,10 +602,9 @@ HTML_CONTENT = """
                         return;
                     }
                     
-                    sendMessage(text);
+                    sendMessage(combinedText);
                 } else {
                     document.getElementById('transcript').textContent = 'No speech detected. Try again.';
-                    interruptionTranscript = '';
                     
                     if (continuousMode) {
                         setTimeout(() => startListening(), 1000);
@@ -528,12 +617,23 @@ HTML_CONTENT = """
             recognition.onerror = (event) => {
                 console.error('Speech recognition error:', event.error);
                 isListening = false;
-                interruptionTranscript = '';
+                
+                if (speechContinuationTimer) {
+                    clearTimeout(speechContinuationTimer);
+                    speechContinuationTimer = null;
+                }
+                
+                if (interruptionAutoSubmitTimer) {
+                    clearTimeout(interruptionAutoSubmitTimer);
+                    interruptionAutoSubmitTimer = null;
+                }
+                
                 updateUI();
                 
                 if (event.error !== 'no-speech' && event.error !== 'aborted') {
                     showError(`Speech error: ${event.error}`);
                     continuousMode = false;
+                    interruptionTranscript = '';
                 }
                 
                 if (continuousMode && event.error === 'no-speech') {
@@ -541,56 +641,96 @@ HTML_CONTENT = """
                 }
             };
             
-            // Background recognition with REASONABLE thresholds
+            // Background recognition for interruptions - FIXED: CONTINUOUS ACCUMULATION
             backgroundRecognition = new SpeechRecognition();
             backgroundRecognition.continuous = true;
             backgroundRecognition.interimResults = true;
             backgroundRecognition.lang = 'en-US';
             
             backgroundRecognition.onstart = () => {
-                logDebug('Background recognition started');
+                backgroundAccumulatedText = '';
+                backgroundFinalTranscript = '';
+                if (interruptionTriggerTimer) {
+                    clearTimeout(interruptionTriggerTimer);
+                    interruptionTriggerTimer = null;
+                }
+                logDebug('Background recognition started - listening for interruption');
             };
             
             backgroundRecognition.onresult = (event) => {
+                // REMOVED interruptionPending from this check to allow continuous accumulation
                 if (!isSpeaking || !voiceInterrupt) return;
                 
                 const now = Date.now();
                 
-                // Initial delay to avoid echo
+                // LONGER initial delay to avoid TTS echo (1200ms default, configurable)
                 if (speakingStartTime && (now - speakingStartTime) < interruptionDelay) {
                     return;
                 }
                 
-                // Cooldown between interruptions
-                if (now - lastInterruptionTime < interruptionCooldown) {
+                // Cooldown between interruptions (only check if no active timer)
+                if (!interruptionTriggerTimer && (now - lastInterruptionTime < interruptionCooldown)) {
                     return;
                 }
                 
-                // Collect ANY detected text (more lenient)
-                let detectedText = '';
+                // PROPERLY ACCUMULATE: Process ALL results to build complete transcript
+                let finalText = '';
+                let interimText = '';
                 
-                for (let i = event.resultIndex; i < event.results.length; i++) {
+                // Loop through ALL results (not just new ones) to get complete transcription
+                for (let i = 0; i < event.results.length; i++) {
                     const transcript = event.results[i][0].transcript;
-                    const confidence = event.results[i][0].confidence || 0;
+                    const confidence = event.results[i][0].confidence || 1.0;
+                    const isFinal = event.results[i].isFinal;
                     
-                    // Accept moderate confidence (0.5+) instead of very high
-                    if (!confidence || confidence > 0.5) {
-                        detectedText += transcript + ' ';
+                    // HIGHER confidence threshold (0.75 instead of 0.5) to avoid TTS echo
+                    if (!confidence || confidence > 0.75) {
+                        if (isFinal) {
+                            finalText += transcript + ' ';
+                        } else {
+                            interimText += transcript + ' ';
+                        }
                     }
                 }
                 
-                detectedText = detectedText.trim();
+                // Build complete accumulated text (final + interim)
+                backgroundFinalTranscript = finalText.trim();
+                backgroundAccumulatedText = (finalText + interimText).trim();
                 
-                // Count words (filter very short ones)
-                const words = detectedText.split(/\s+/).filter(w => w.length > 1);
+                // Filter out if this matches recent TTS output (echo detection)
+                if (lastTTSText && backgroundAccumulatedText.length > 0) {
+                    const lowerAccumulated = backgroundAccumulatedText.toLowerCase();
+                    const lowerTTS = lastTTSText.toLowerCase().slice(0, 50); // First 50 chars of TTS
+                    
+                    // If accumulated text is similar to TTS start, it's echo
+                    if (lowerTTS.includes(lowerAccumulated) || lowerAccumulated.includes(lowerTTS.slice(0, 20))) {
+                        logDebug(`FILTERED ECHO: "${backgroundAccumulatedText}" (matches TTS)`);
+                        return;
+                    }
+                }
+                
+                // Count words
+                const words = backgroundAccumulatedText.split(/\s+/).filter(w => w.length > 1);
                 const wordCount = words.length;
                 
-                logDebug(`Detected: "${detectedText}" (${wordCount} words, conf: ${event.results[event.results.length-1]?.[0]?.confidence?.toFixed(2) || 'N/A'})`);
+                const avgConfidence = event.results[event.results.length-1]?.[0]?.confidence?.toFixed(2) || 'N/A';
+                logDebug(`Detected: "${backgroundAccumulatedText}" (${wordCount} words, conf: ${avgConfidence})`);
                 
-                if (wordCount >= minWordsToInterrupt) {
-                    console.log(`✅ Voice interruption triggered! (${wordCount} words):`, detectedText);
-                    logDebug(`✅ INTERRUPTING with: "${detectedText}"`);
-                    handleVoiceInterruption(detectedText);
+                // Trigger interruption only if we have enough words AND no active timer
+                if (wordCount >= minWordsToInterrupt && !interruptionTriggerTimer) {
+                    console.log(`Voice interruption triggered! (${wordCount} words):`, backgroundAccumulatedText);
+                    logDebug(`INTERRUPTING with: "${backgroundAccumulatedText}"`);
+                    
+                    // Keep background running for 500ms MORE to capture additional words
+                    // This extended delay allows user to complete their phrase
+                    // NOTE: We DON'T set interruptionPending here, allowing continued accumulation
+                    interruptionTriggerTimer = setTimeout(() => {
+                        // Capture the LATEST accumulated text at the moment of handoff
+                        const capturedText = backgroundAccumulatedText || backgroundFinalTranscript;
+                        logDebug(`Final captured text: "${capturedText}"`);
+                        handleVoiceInterruption(capturedText);
+                        interruptionTriggerTimer = null;
+                    }, 500);  // Reduced to 500ms for faster response
                 }
             };
             
@@ -602,6 +742,13 @@ HTML_CONTENT = """
             
             backgroundRecognition.onend = () => {
                 logDebug('Background recognition ended');
+                
+                // Don't clear accumulated text if timer is active
+                if (!interruptionTriggerTimer) {
+                    backgroundAccumulatedText = '';
+                    backgroundFinalTranscript = '';
+                }
+                
                 // Auto-restart if still speaking
                 if (isSpeaking && voiceInterrupt) {
                     setTimeout(() => {
@@ -621,6 +768,12 @@ HTML_CONTENT = """
             lastInterruptionTime = Date.now();
             interruptionTranscript = detectedText;
             
+            // Clear the timer since we're handling now
+            if (interruptionTriggerTimer) {
+                clearTimeout(interruptionTriggerTimer);
+                interruptionTriggerTimer = null;
+            }
+            
             stopSpeaking();
             
             if (currentAssistantMessage) {
@@ -633,22 +786,40 @@ HTML_CONTENT = """
             
             const status = document.getElementById('status');
             status.className = 'status interrupting';
-            status.textContent = '🎙️ Interrupting... Speak now!';
+            status.textContent = 'Interrupted! Continue speaking...';
             
-            if (detectedText) {
-                document.getElementById('transcript').innerHTML = 
-                    '<strong style="color: #ff5722;">Interrupted! Continue speaking: "' + detectedText + '..."</strong>';
-            }
+            // Show the captured interruption text
+            document.getElementById('transcript').innerHTML = 
+                '<strong style="color: #ff5722;">Interrupted with:</strong> ' +
+                '<span style="color: #333;">"' + detectedText + '"</span><br>' +
+                '<i style="color: #666;">Continue speaking or wait 2 seconds to submit</i>';
             
+            logDebug(`Interruption captured: "${detectedText}". Starting main recognition immediately.`);
+            
+            // Start main recognition IMMEDIATELY (50ms delay)
             setTimeout(() => {
                 startListening();
-            }, 300);
+                
+                // NEW: Set auto-submit timer - if no new speech in 2 seconds, submit what we have
+                interruptionAutoSubmitTimer = setTimeout(() => {
+                    logDebug('Auto-submit triggered - no additional speech detected');
+                    
+                    // If still listening and we have interruption text, submit it
+                    if (isListening && interruptionTranscript) {
+                        logDebug(`Auto-submitting: "${interruptionTranscript}"`);
+                        recognition.stop(); // This will trigger onend which sends the message
+                    }
+                    interruptionAutoSubmitTimer = null;
+                }, 2000);  // 2 second timeout
+            }, 50);
         }
 
         function startBackgroundRecognition() {
             if (!backgroundRecognition || !voiceInterrupt || isListening) return;
             
             try {
+                backgroundAccumulatedText = '';
+                backgroundFinalTranscript = '';
                 backgroundRecognition.start();
                 logDebug('Started background listening for interruption');
             } catch (e) {
@@ -661,6 +832,12 @@ HTML_CONTENT = """
             
             try {
                 backgroundRecognition.stop();
+                backgroundAccumulatedText = '';
+                backgroundFinalTranscript = '';
+                if (interruptionTriggerTimer) {
+                    clearTimeout(interruptionTriggerTimer);
+                    interruptionTriggerTimer = null;
+                }
                 logDebug('Stopped background recognition');
             } catch (e) {}
         }
@@ -684,59 +861,40 @@ HTML_CONTENT = """
                 return;
             }
             
-            speechSynthesis.cancel();
+            stopSpeaking();
             
-            if (!text || !text.trim()) {
-                if (continuousMode) {
-                    setTimeout(() => startListening(), 500);
-                }
-                return;
-            }
+            const utterance = new SpeechSynthesisUtterance(text);
+            utterance.rate = 1.0;
+            utterance.pitch = 1.0;
+            utterance.volume = 1.0;
             
-            isSpeaking = true;
-            speakingStartTime = Date.now();
-            updateUI();
+            lastTTSText = text.slice(0, 100);
             
-            logDebug(`Starting TTS, will listen for interruption after ${interruptionDelay}ms`);
-            
-            // Start background recognition after delay
-            if (voiceInterrupt) {
-                setTimeout(() => startBackgroundRecognition(), interruptionDelay);
-            }
-            
-            currentUtterance = new SpeechSynthesisUtterance(text);
-            currentUtterance.rate = 1.0;
-            currentUtterance.pitch = 1.0;
-            currentUtterance.volume = 1.0;
-            currentUtterance.lang = 'en-US';
-            
-            currentUtterance.onstart = () => {
+            utterance.onstart = () => {
                 isSpeaking = true;
                 speakingStartTime = Date.now();
                 updateUI();
-                logDebug('TTS started');
+                
+                setTimeout(() => {
+                    startBackgroundRecognition();
+                }, interruptionDelay);
             };
             
-            currentUtterance.onend = () => {
+            utterance.onend = () => {
                 isSpeaking = false;
-                currentUtterance = null;
                 speakingStartTime = null;
-                
                 stopBackgroundRecognition();
                 updateUI();
-                logDebug('TTS ended normally');
                 
                 if (continuousMode) {
                     setTimeout(() => startListening(), 500);
                 }
             };
             
-            currentUtterance.onerror = (event) => {
+            utterance.onerror = (event) => {
                 console.error('Speech synthesis error:', event);
                 isSpeaking = false;
-                currentUtterance = null;
                 speakingStartTime = null;
-                
                 stopBackgroundRecognition();
                 updateUI();
                 
@@ -745,72 +903,45 @@ HTML_CONTENT = """
                 }
             };
             
-            speechSynthesis.speak(currentUtterance);
+            speechSynthesis.speak(utterance);
         }
 
         function stopSpeaking() {
-            if (speechSynthesis) {
+            if (speechSynthesis && speechSynthesis.speaking) {
                 speechSynthesis.cancel();
             }
             isSpeaking = false;
-            currentUtterance = null;
             speakingStartTime = null;
-            
             stopBackgroundRecognition();
-            updateUI();
-            logDebug('TTS stopped (interrupted)');
         }
 
         function startListening() {
-            if (!recognition) {
-                showError('Speech recognition not initialized');
-                return;
-            }
-            
-            if (isListening || isProcessing) {
-                return;
-            }
-            
-            stopBackgroundRecognition();
-            
-            if (!interruptionTranscript) {
-                currentTranscript = '';
-                document.getElementById('transcript').textContent = 'Listening...';
-            }
+            if (!recognition || isListening || isProcessing) return;
             
             try {
+                stopSpeaking();
+                currentTranscript = '';
                 recognition.start();
             } catch (e) {
-                if (!e.message.includes('already started')) {
-                    console.error('Failed to start recognition:', e);
-                }
+                console.error('Failed to start recognition:', e);
+            }
+        }
+
+        function stopListening() {
+            if (recognition && isListening) {
+                recognition.stop();
+            }
+            
+            // Clear auto-submit timer if stopping manually
+            if (interruptionAutoSubmitTimer) {
+                clearTimeout(interruptionAutoSubmitTimer);
+                interruptionAutoSubmitTimer = null;
             }
         }
 
         function toggleVoice() {
-            if (!recognition) {
-                showError('Speech recognition not initialized');
-                return;
-            }
-            
-            if (isSpeaking) {
-                handleVoiceInterruption('');
-                return;
-            }
-            
-            if (continuousMode) {
-                continuousMode = false;
-                if (isListening) {
-                    recognition.stop();
-                }
-                stopBackgroundRecognition();
-                updateUI();
-                document.getElementById('transcript').textContent = 'Continuous mode stopped';
-                return;
-            }
-            
             if (isListening) {
-                recognition.stop();
+                stopListening();
             } else {
                 startListening();
             }
@@ -818,41 +949,62 @@ HTML_CONTENT = """
 
         function toggleContinuousMode() {
             continuousMode = !continuousMode;
-            
-            const btn = document.getElementById('continuousBtn');
-            btn.textContent = continuousMode ? '🔄 Continuous Mode: ON' : '🔄 Continuous Mode: OFF';
-            btn.className = continuousMode ? 'continuous-btn active' : 'continuous-btn';
-            
-            if (continuousMode) {
-                document.getElementById('transcript').textContent = 'Continuous mode activated. Start speaking...';
-                startListening();
-            } else {
-                if (isListening) {
-                    recognition.stop();
-                }
-                stopSpeaking();
-                stopBackgroundRecognition();
-                document.getElementById('transcript').textContent = 'Continuous mode deactivated';
-            }
-            
             updateUI();
+            
+            if (continuousMode && !isListening && !isSpeaking && !isProcessing) {
+                startListening();
+            }
         }
 
         function toggleVoiceInterrupt() {
             voiceInterrupt = !voiceInterrupt;
-            const btn = document.getElementById('voiceInterruptBtn');
-            const settings = document.getElementById('voiceInterruptSettings');
-            
-            btn.textContent = voiceInterrupt ? '🎙️ Voice Interrupt: ON' : '🎙️ Voice Interrupt: OFF';
-            btn.className = voiceInterrupt ? 'toggle-btn active' : 'toggle-btn';
-            
-            logDebug(`Voice interrupt: ${voiceInterrupt ? 'ENABLED' : 'DISABLED'}`);
+            updateUI();
             
             if (!voiceInterrupt) {
                 stopBackgroundRecognition();
-            } else if (isSpeaking) {
-                setTimeout(() => startBackgroundRecognition(), interruptionDelay);
             }
+        }
+
+        function toggleAutoSpeak() {
+            autoSpeak = !autoSpeak;
+            updateUI();
+        }
+
+        function updateUI() {
+            const voiceBtn = document.getElementById('voiceButton');
+            const status = document.getElementById('status');
+            const continuousBtn = document.getElementById('continuousBtn');
+            const voiceInterruptBtn = document.getElementById('voiceInterruptBtn');
+            const autoSpeakBtn = document.getElementById('autoSpeakBtn');
+            
+            voiceBtn.className = '';
+            status.className = 'status';
+            
+            if (isSpeaking) {
+                voiceBtn.classList.add('speaking');
+                status.classList.add('speaking');
+                status.textContent = 'Speaking...';
+            } else if (isListening) {
+                voiceBtn.classList.add('listening');
+                status.classList.add('listening');
+                status.textContent = 'Listening...';
+            } else if (continuousMode) {
+                voiceBtn.classList.add('continuous');
+                status.classList.add('continuous');
+                status.textContent = 'Continuous Mode Active';
+            } else {
+                status.classList.add('idle');
+                status.textContent = 'Click to start';
+            }
+            
+            continuousBtn.className = 'continuous-btn' + (continuousMode ? ' active' : '');
+            continuousBtn.textContent = '🔄 Continuous: ' + (continuousMode ? 'ON' : 'OFF');
+            
+            voiceInterruptBtn.className = 'toggle-btn' + (voiceInterrupt ? ' active' : '');
+            voiceInterruptBtn.textContent = '🎙️ Voice Interrupt: ' + (voiceInterrupt ? 'ON' : 'OFF');
+            
+            autoSpeakBtn.className = 'toggle-btn' + (autoSpeak ? ' active' : '');
+            autoSpeakBtn.textContent = '🔊 Auto-Speak: ' + (autoSpeak ? 'ON' : 'OFF');
         }
 
         function sendMessage(text) {
@@ -862,104 +1014,71 @@ HTML_CONTENT = """
             }
             
             ws.send(JSON.stringify({
-                type: 'user_input',
+                type: 'user_message',
                 text: text
             }));
+        }
+
+        function addMessage(role, content) {
+            const conversation = document.getElementById('conversation');
+            const messageDiv = document.createElement('div');
+            messageDiv.className = `message ${role}`;
             
-            document.getElementById('transcript').textContent = 'Processing...';
+            const label = document.createElement('div');
+            label.className = 'message-label';
+            label.textContent = role === 'user' ? 'You' : 'Assistant';
+            
+            const text = document.createElement('div');
+            text.textContent = content;
+            
+            messageDiv.appendChild(label);
+            messageDiv.appendChild(text);
+            conversation.appendChild(messageDiv);
+            conversation.scrollTop = conversation.scrollHeight;
         }
 
-        function addMessage(role, text) {
-            const conv = document.getElementById('conversation');
-            const msg = document.createElement('div');
-            msg.className = `message ${role}`;
-            msg.innerHTML = `
-                <div class="message-label">${role === 'user' ? '👤 You' : '🤖 Assistant'}</div>
-                <div>${text}</div>
-            `;
-            conv.appendChild(msg);
-            conv.scrollTop = conv.scrollHeight;
-        }
-
-        let currentAssistantMessage = null;
-
-        function updateAssistantMessage(text) {
+        function updateAssistantMessage(content) {
             if (!currentAssistantMessage) {
-                const conv = document.getElementById('conversation');
+                const conversation = document.getElementById('conversation');
                 currentAssistantMessage = document.createElement('div');
                 currentAssistantMessage.className = 'message assistant';
-                currentAssistantMessage.innerHTML = `
-                    <div class="message-label">🤖 Assistant</div>
-                    <div class="content">${text}</div>
-                `;
-                conv.appendChild(currentAssistantMessage);
+                
+                const label = document.createElement('div');
+                label.className = 'message-label';
+                label.textContent = 'Assistant';
+                
+                const text = document.createElement('div');
+                text.className = 'message-text';
+                text.textContent = content;
+                
+                currentAssistantMessage.appendChild(label);
+                currentAssistantMessage.appendChild(text);
+                conversation.appendChild(currentAssistantMessage);
             } else {
-                const content = currentAssistantMessage.querySelector('.content');
-                content.textContent = text;
+                const textDiv = currentAssistantMessage.querySelector('.message-text');
+                if (textDiv) {
+                    textDiv.textContent = content;
+                }
             }
             
-            const conv = document.getElementById('conversation');
-            conv.scrollTop = conv.scrollHeight;
+            const conversation = document.getElementById('conversation');
+            conversation.scrollTop = conversation.scrollHeight;
         }
 
         function finalizeAssistantMessage() {
             currentAssistantMessage = null;
-            if (!continuousMode) {
-                document.getElementById('transcript').textContent = 'Click to start speaking';
-            }
-        }
-
-        function toggleAutoSpeak() {
-            autoSpeak = !autoSpeak;
-            const btn = document.getElementById('autoSpeakBtn');
-            btn.textContent = autoSpeak ? '🔊 Auto-Speak: ON' : '🔇 Auto-Speak: OFF';
-            btn.className = autoSpeak ? 'toggle-btn active' : 'toggle-btn';
-            
-            if (!autoSpeak && isSpeaking) {
-                stopSpeaking();
-            }
         }
 
         function clearConversation() {
             document.getElementById('conversation').innerHTML = '';
-            document.getElementById('transcript').textContent = 'Conversation cleared. Click to start speaking.';
+            document.getElementById('transcript').textContent = 'Conversation cleared.';
+            currentAssistantMessage = null;
             responseBuffer = '';
-            interruptionTranscript = '';
-            stopSpeaking();
-            stopBackgroundRecognition();
-        }
-
-        function updateUI() {
-            const button = document.getElementById('voiceButton');
-            const status = document.getElementById('status');
-            
-            button.className = '';
-            
-            if (continuousMode && !isListening && !isSpeaking) {
-                button.classList.add('continuous');
-                button.textContent = '🔄';
-                status.className = 'status continuous';
-                status.textContent = 'Continuous mode active';
-            } else if (isSpeaking) {
-                button.classList.add('speaking');
-                button.textContent = '🔊';
-                status.className = 'status speaking';
-                status.textContent = voiceInterrupt ? 'Speaking... (Start talking to interrupt)' : 'Speaking...';
-            } else if (isListening) {
-                button.classList.add('listening');
-                button.textContent = '🎙️';
-                status.className = 'status listening';
-                status.textContent = 'Listening... Speak now!';
-            } else {
-                button.textContent = '🎤';
-                status.className = 'status idle';
-                status.textContent = continuousMode ? 'Waiting...' : 'Click to start';
-            }
         }
 
         function showError(message) {
             const errorBox = document.getElementById('errorBox');
-            errorBox.textContent = '❌ ' + message;
+            errorBox.textContent = message;
             errorBox.style.display = 'block';
         }
 
@@ -967,9 +1086,26 @@ HTML_CONTENT = """
             document.getElementById('errorBox').style.display = 'none';
         }
 
+        // Initialize
         window.onload = () => {
-            if (initSpeechRecognition()) {
-                connectWebSocket();
+            if (!initSpeechRecognition()) {
+                showError('Speech recognition not available');
+                return;
+            }
+            
+            connectWebSocket();
+        };
+
+        // Cleanup
+        window.onbeforeunload = () => {
+            stopListening();
+            stopSpeaking();
+            stopBackgroundRecognition();
+            if (interruptionAutoSubmitTimer) {
+                clearTimeout(interruptionAutoSubmitTimer);
+            }
+            if (ws) {
+                ws.close();
             }
         };
     </script>
@@ -984,67 +1120,55 @@ async def get_home():
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
-    """
-    WebSocket endpoint for real-time voice interaction
-    Supports continuous conversation mode with voice interruption
-    """
+    """Handle WebSocket connections"""
     await websocket.accept()
-    session_id = str(uuid4())
+    logger.info("WebSocket connection accepted")
     
     try:
         while True:
-            # Receive message from client
             data = await websocket.receive_text()
             message = json.loads(data)
             
-            if message['type'] == 'user_input':
-                user_text = message['text']
+            if message.get('type') == 'user_message':
+                user_input = message.get('text', '')
+                logger.info(f"Received user message: {user_input[:100]}...")
                 
-                # Send transcript back to client
+                # Echo transcript back
                 await websocket.send_text(json.dumps({
                     'type': 'transcript',
-                    'text': user_text
+                    'text': user_input
                 }))
                 
-                # Stream agent response
                 try:
-                    full_response = ""
-                    async for chunk in agent.stream_response(
-                        user_input=user_text,
-                        session_id=session_id
-                    ):
-                        full_response += chunk
-                        
-                        # Send text chunk to client
+                    # Stream agent response
+                    logger.debug("Starting agent response stream")
+                    async for chunk in agent.stream_response(user_input):
                         await websocket.send_text(json.dumps({
                             'type': 'agent_chunk',
                             'text': chunk
                         }))
                     
-                    # Signal completion (triggers TTS in browser)
+                    # Send completion signal
                     await websocket.send_text(json.dumps({
                         'type': 'agent_complete'
                     }))
+                    logger.info("Agent response completed successfully")
                     
                 except Exception as e:
+                    logger.error(f"Error in agent response: {e}", exc_info=True)
                     await websocket.send_text(json.dumps({
                         'type': 'error',
-                        'message': str(e)
+                        'message': f'Error: {str(e)}'
                     }))
     
     except WebSocketDisconnect:
-        print(f"Client disconnected: {session_id}")
+        logger.info("WebSocket client disconnected")
     except Exception as e:
-        print(f"WebSocket error: {e}")
-        try:
-            await websocket.send_text(json.dumps({
-                'type': 'error',
-                'message': str(e)
-            }))
-        except:
-            pass
+        logger.error(f"WebSocket error: {e}", exc_info=True)
+    finally:
+        logger.info("WebSocket connection closed")
 
-# Run with: python -m uvicorn app:app --host 0.0.0.0 --port 8000
 if __name__ == "__main__":
     import uvicorn
+    logger.info("Starting Voice Assistant server on port 8000")
     uvicorn.run(app, host="0.0.0.0", port=8000)
