@@ -1,0 +1,17 @@
+command:
+  - "python"
+  - "app.py"
+
+port: 8000
+
+env:
+  - name: WHISPER_ENDPOINT
+    value: "whisper-small"
+  - name: LLM_ENDPOINT  
+    value: "databricks-qwen3-next-80b-a3b-instruct"
+
+resources:
+  - name: default
+    compute:
+      size: SMALL
+      gpu: false

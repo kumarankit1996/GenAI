@@ -1,0 +1,8 @@
+databricks-sdk
+langchain
+langchain-community
+fastapi
+uvicorn[standard]
+websockets
+aiofiles
+python-multipart
