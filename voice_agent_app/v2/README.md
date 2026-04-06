@@ -266,6 +266,145 @@ End conversations naturally by saying:
 
 The system will detect these and gracefully end the continuous conversation mode.
 
+
+
+### Voice Interruption Technical Details
+
+**Recent Improvements:** Four major fixes implemented to ensure robust, natural interruption handling:
+
+#### Fix #1: Echo/False Interruptions from TTS ✅
+
+**Problem:** Background recognition detected assistant's own voice as user interruption (e.g., "thank you how" from assistant TTS)
+
+**Solution:**
+* Increased confidence threshold: **0.5 → 0.75**
+* Increased initial delay: **700ms → 1200ms** (configurable)
+* Increased min words: **2 → 3 words** (default)
+* Added echo detection: Compares detected text with recent TTS output
+* Filters if detected text matches >70% of TTS words
+
+**Key Variables:**
+```javascript
+let interruptionDelay = 1200;      // Configurable via slider (800-2000ms)
+let lastTTSText = '';              // Stores recent TTS for comparison
+```
+
+#### Fix #2: Incomplete Phrase Capture ✅
+
+**Problem:** System captured "what do you" but missed "think about AI" — only first 3 words detected instead of full phrase
+
+**Root Cause:** Early return in `backgroundRecognition.onresult` blocked further text accumulation after trigger
+
+**Solution:**
+* **Removed blocking check** from `onresult` handler
+* Background recognition **continues accumulating** during 500ms trigger window
+* Timer prevents duplicate triggers while allowing phrase completion
+* Captures full phrase: "what do you think about AI" ✅
+
+**Key Variables:**
+```javascript
+let backgroundAccumulatedText = '';   // Accumulates ALL detected words
+let interruptionTriggerTimer = null;  // 500ms window for phrase completion
+```
+
+#### Fix #3: Auto-Submit After Interruption ✅
+
+**Problem:** After capturing interruption, if user didn't speak within 2 seconds, system showed "No speech detected" instead of submitting captured text
+
+**Solution:**
+* Added `interruptionAutoSubmitTimer` (2-second timeout)
+* Starts when main recognition begins after interruption
+* If timer fires and `interruptionTranscript` exists, calls `recognition.stop()` to submit
+* `recognition.onend` checks for `interruptionTranscript` even when `currentTranscript` is empty
+
+**Key Variables:**
+```javascript
+let interruptionAutoSubmitTimer = null;  // 2-second auto-submit timer
+```
+
+#### Fix #4: Transcript Duplication Bug ✅
+
+**Problem:** Words repeated in final message: "in what countries does **in what countries does** tell me everything"
+
+**Root Cause:** `interruptionTranscript` added **twice**:
+1. In `onresult`: `currentTranscript = interruptionTranscript + ' ' + newSpeech`
+2. In `onend`: `combinedText = interruptionTranscript + ' ' + currentTranscript`
+
+**Solution:**
+* `currentTranscript` now stores **ONLY new speech** (line 541)
+* Combination happens **exactly once** in `onend` (line 590)
+* Result: Clean, non-duplicated messages ✅
+
+**Before:**
+```javascript
+// onresult - WRONG!
+currentTranscript = interruptionTranscript + ' ' + newSpeech;
+
+// onend - Adds interruption AGAIN
+combinedText = interruptionTranscript + ' ' + currentTranscript;
+// Result: "in what countries does in what countries does tell me"
+```
+
+**After:**
+```javascript
+// onresult - Store ONLY new speech
+currentTranscript = finalTranscript || interimTranscript;
+
+// onend - Combine ONCE
+const combinedText = (interruptionTranscript + ' ' + currentTranscript).trim();
+// Result: "in what countries does tell me everything" ✅
+```
+
+### Complete Interruption Flow (After All Fixes)
+
+1. **User interrupts during TTS:** "what do you think about AI"
+2. **Background recognition** (after 1200ms delay):
+   * Detects 3+ words → starts 500ms timer
+   * **Continues listening** during timer (no blocking)
+   * Accumulates full phrase in `backgroundAccumulatedText`
+3. **After 500ms:** Calls `handleVoiceInterruption(fullPhrase)`
+4. **Main recognition starts**:
+   * Shows: "Interrupted with: 'what do you think about AI'"
+   * Hint: "Continue speaking or wait 2 seconds to submit"
+   * Sets 2-second auto-submit timer
+5. **Two paths:**
+   * **User continues:** Timer cancelled, new speech added to `currentTranscript`
+   * **User silent 2s:** Timer fires, calls `recognition.stop()`
+6. **recognition.onend:**
+   * **Combines once:** `combinedText = interruptionTranscript + ' ' + currentTranscript`
+   * Submits combined text (interruption + continuation, or just interruption)
+
+### Configurable Settings
+
+| Setting | Default | Range | Purpose |
+|---------|---------|-------|---------|
+| **Min Words** | 3 | 2-10 | Words needed to trigger interruption |
+| **Detection Delay** | 1200ms | 800-2000ms | Initial delay to avoid TTS echo |
+| **Auto-Submit** | 2000ms | Fixed | Timeout for continuing speech |
+| **Confidence** | 0.75 | Fixed | Min confidence to accept detection |
+| **Capture Window** | 500ms | Fixed | Extra time to complete phrase |
+
+### Debug Mode
+
+Enable "Show Debug Info" checkbox to see:
+* Detection events with word count and confidence
+* Echo filtering events  
+* Timer events (trigger, cancel, auto-submit)
+* Combined text before submission
+
+### Best Practices
+
+✅ **DO:**
+* Use headphones to minimize TTS echo
+* Speak clearly with 3+ words to interrupt
+* Enable debug mode when tuning sensitivity
+* Adjust delay slider if experiencing false triggers
+
+❌ **DON'T:**
+* Use laptop speakers (causes echo and false triggers)
+* Set min words too low (< 2 increases false positives)
+* Set delay too short (< 1000ms may detect TTS echo)
+
 ### Controls
 
 * **🔄 Continuous Mode: ON/OFF** - Enable fully hands-free conversation
